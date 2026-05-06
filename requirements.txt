@@ -1,28 +1,7 @@
-# MixMasterOS Worker
-
-Private Supabase background worker for MixMasterOS. Polls the `audio_jobs`
-table, downloads source audio from the `audio` storage bucket, runs the
-internal mixing/mastering DSP chain, and uploads the rendered WAV + MP3 back
-to storage.
-
-## Deploy on Render (Background Worker)
-
-1. Push this folder to a GitHub repo.
-2. On Render: **New → Background Worker** → connect the repo.
-3. Environment: **Docker** (uses the included `Dockerfile`).
-4. Add environment variables:
-   - `SUPABASE_URL`
-   - `SUPABASE_SERVICE_ROLE_KEY`
-5. Deploy.
-
-The worker runs `python worker/main.py` and loops forever, claiming queued
-jobs one at a time. No public API, no third-party mastering service.
-
-## Local run
-
-```bash
-pip install -r requirements.txt
-export SUPABASE_URL=...
-export SUPABASE_SERVICE_ROLE_KEY=...
-python worker/main.py
-```
+supabase
+python-dotenv
+numpy
+scipy
+librosa
+soundfile
+pyloudnorm
