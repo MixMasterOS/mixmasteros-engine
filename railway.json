@@ -1,0 +1,14 @@
+app = "mixmasteros-engine"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+# Background worker - no http_service block
+[processes]
+  worker = "python -m worker.main"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 2
+  memory_mb = 2048

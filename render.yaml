@@ -1,0 +1,81 @@
+# MixMasterOS™ Internal Audio Engine
+
+This is the **private worker** that powers MixMasterOS mastering. It is not
+a third-party mastering API. It belongs to your platform.
+
+## How it works
+
+```
+User in MixMasterOS app
+        │
+        ▼
+Supabase Storage (audio bucket)  ◄──────────────┐
+        │                                       │
+        ▼                                       │
+Supabase DB (projects + audio_jobs status='queued')
+        │                                       │
+        ▼                                       │
+THIS WORKER (polls every 3s)                    │
+  • claims job atomically                       │
+  • downloads source / stems                    │
+  • runs pedalboard mastering chain             │
+  • runs librosa + pyloudnorm analysis          │
+  • encodes WAV + 320kbps MP3 with ffmpeg       │
+  • uploads rendered masters ────────────────►──┘
+  • updates projects.status = 'complete'
+```
+
+The end user **never sees this worker**. They just upload in the app and
+click Master. Status, progress, stages, before/after analysis, and the
+final WAV/MP3 download all flow through Supabase.
+
+## Required env vars
+
+Only Supabase credentials. No `MIXMASTER_API_URL`, no API keys exposed
+to the browser, no third-party services.
+
+```
+SUPABASE_URL=https://YOUR-PROJECT.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=...service role key (server-only)...
+AUDIO_BUCKET=audio        # optional, defaults to "audio"
+POLL_INTERVAL=3           # optional
+```
+
+## Deploy
+
+### Render (recommended)
+1. Push this folder to a private GitHub repo.
+2. https://dashboard.render.com → New → Background Worker → connect repo.
+3. Render reads `render.yaml`. In the Environment tab set:
+   - `SUPABASE_URL`
+   - `SUPABASE_SERVICE_ROLE_KEY`
+4. Deploy. The worker starts polling immediately.
+
+### Railway
+1. New Project → Deploy from GitHub repo.
+2. Variables tab: add the two env vars above.
+
+### Fly.io
+```
+fly launch --copy-config --no-deploy
+fly secrets set SUPABASE_URL=... SUPABASE_SERVICE_ROLE_KEY=...
+fly deploy
+```
+
+### Self-host (any Linux box / VPS)
+```
+docker build -t mixmaster-engine .
+docker run -d --restart=always \
+  -e SUPABASE_URL=... \
+  -e SUPABASE_SERVICE_ROLE_KEY=... \
+  mixmaster-engine
+```
+
+## Why a separate worker?
+
+Heavy audio DSP (FFmpeg, librosa, pedalboard, native codecs) cannot run
+inside Supabase Edge Functions (Deno, no native binaries, 150s limit, no
+ffmpeg). This worker is the smallest possible container that runs that
+DSP — owned by you, branded MixMasterOS, talking only to your Supabase.
+
+There is **no third-party mastering API** in this stack.
