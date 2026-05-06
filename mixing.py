@@ -1,7 +1,7 @@
 import numpy as np
 import pyloudnorm as pyln
 from pedalboard import Pedalboard, Compressor, Gain, Limiter, HighpassFilter, LowpassFilter
-from worker.audio_engine import load_audio, save_audio
+from audio_engine import load_audio, save_audio
 
 GENRE_TARGETS = {
     "corrido": -9.5, "christian_corrido": -9.5,

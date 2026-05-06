@@ -1,56 +1,54 @@
+"""MixMasterOS internal DSP engine. No third-party mastering APIs."""
 import numpy as np
-from pedalboard import Pedalboard, Compressor, Gain, HighpassFilter, LowpassFilter, Reverb
-from worker.audio_engine import load_audio, save_audio
+import librosa
+import pyloudnorm as pyln
+import soundfile as sf
 
 
-HP = {"lead_vocal": 80, "background_vocals": 100, "adlibs": 100,
-      "guitars": 70, "keys": 60, "drums": 30, "bass": 25, "beat": 25}
-LP = {"bass": 6000, "drums": 16000, "beat": 18000, "lead_vocal": 17000}
+def load_audio(path: str, sr: int = 44100):
+    audio, sample_rate = librosa.load(path, sr=sr, mono=False)
+    if audio.ndim == 1:
+        audio = np.stack([audio, audio], axis=0)
+    return audio.T, sample_rate
 
 
-def stem_settings(genre: str):
-    if genre in ["rap", "trap"]:
-        return {"lead_vocal": {"gain": 2.0, "comp": 2.8}, "adlibs": {"gain": -2.5, "comp": 2.0},
-                "beat": {"gain": -1.0, "comp": 1.6}, "drums": {"gain": 1.0, "comp": 2.2},
-                "bass": {"gain": 1.5, "comp": 2.0}}
-    if genre in ["corrido", "christian_corrido"]:
-        return {"lead_vocal": {"gain": 1.8, "comp": 2.0}, "guitars": {"gain": 0.8, "comp": 1.4},
-                "bass": {"gain": 0.5, "comp": 1.6}, "drums": {"gain": 0.6, "comp": 1.8}}
-    if genre in ["worship", "gospel"]:
-        return {"lead_vocal": {"gain": 2.0, "comp": 1.8}, "background_vocals": {"gain": -1.0, "comp": 1.5},
-                "keys": {"gain": 0.5, "comp": 1.3}, "guitars": {"gain": 0.2, "comp": 1.3},
-                "drums": {"gain": 0.3, "comp": 1.5}, "bass": {"gain": 0.2, "comp": 1.5}}
-    return {"lead_vocal": {"gain": 1.5, "comp": 2.0}, "beat": {"gain": -0.5, "comp": 1.5}}
+def save_audio(path: str, audio, sample_rate: int):
+    audio = np.clip(audio, -1.0, 1.0)
+    sf.write(path, audio, sample_rate)
 
 
-def process_stem(audio, sr, stem_type, settings):
-    cfg = settings.get(stem_type, {})
-    plugins = [
-        HighpassFilter(cutoff_frequency_hz=HP.get(stem_type, 30)),
-        LowpassFilter(cutoff_frequency_hz=LP.get(stem_type, 18000)),
-        Compressor(threshold_db=-20, ratio=cfg.get("comp", 1.5), attack_ms=10, release_ms=100),
-        Gain(gain_db=cfg.get("gain", 0)),
-    ]
-    if stem_type in ["lead_vocal", "background_vocals", "adlibs"]:
-        plugins.append(Reverb(room_size=0.08, wet_level=0.04, dry_level=0.96))
-    return Pedalboard(plugins)(audio, sr)
+def band_energy(audio, sr, low_hz, high_hz):
+    fft = np.abs(np.fft.rfft(audio))
+    freqs = np.fft.rfftfreq(len(audio), 1 / sr)
+    idx = np.where((freqs >= low_hz) & (freqs <= high_hz))[0]
+    if len(idx) == 0:
+        return 0.0
+    return float(np.mean(fft[idx]))
 
 
-def mix_stems(stem_paths: dict, output_path: str, genre: str):
-    settings = stem_settings(genre)
-    mixed = None
-    sr_used = 44100
-    for stem_type, path in stem_paths.items():
-        audio, sr = load_audio(path)
-        sr_used = sr
-        processed = process_stem(audio, sr, stem_type, settings)
-        if mixed is None:
-            mixed = processed
-        else:
-            n = min(len(mixed), len(processed))
-            mixed = mixed[:n] + processed[:n]
-    peak = np.max(np.abs(mixed))
-    if peak > 0:
-        mixed = mixed / peak * 0.85
-    save_audio(output_path, mixed, sr_used)
-    return output_path
+def analyze_audio(path: str):
+    audio, sr = load_audio(path)
+    meter = pyln.Meter(sr)
+    try:
+        loudness = float(meter.integrated_loudness(audio))
+    except Exception:
+        loudness = -23.0
+    peak = float(np.max(np.abs(audio)))
+    rms = float(np.sqrt(np.mean(audio ** 2)))
+    crest = float(peak / rms) if rms > 0 else 0.0
+    mono = np.mean(audio, axis=1)
+    return {
+        "sample_rate": sr,
+        "lufs": loudness,
+        "peak": peak,
+        "rms": rms,
+        "crest_factor": crest,
+        "spectral_centroid": float(np.mean(librosa.feature.spectral_centroid(y=mono, sr=sr))),
+        "spectral_bandwidth": float(np.mean(librosa.feature.spectral_bandwidth(y=mono, sr=sr))),
+        "low_energy": band_energy(mono, sr, 20, 150),
+        "mud_energy": band_energy(mono, sr, 200, 450),
+        "harsh_energy": band_energy(mono, sr, 2500, 5500),
+        "air_energy": band_energy(mono, sr, 10000, 16000),
+        "stereo_width": float(np.mean(np.abs(audio[:, 0] - audio[:, 1]))),
+        "clipping_detected": bool(peak >= 0.98),
+    }

@@ -1,8 +1,11 @@
-{
-  "$schema": "https://railway.app/railway.schema.json",
-  "build": { "builder": "DOCKERFILE", "dockerfilePath": "Dockerfile" },
-  "deploy": {
-    "startCommand": "python -m worker.main",
-    "restartPolicyType": "ON_FAILURE"
-  }
-}
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+CMD ["python", "worker/main.py"]
