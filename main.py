@@ -6,7 +6,6 @@ downloads source audio from the `audio` storage bucket, processes it with
 the internal engine, then uploads the mastered WAV/MP3 back to storage and
 updates both the job and the project.
 """
-
 from __future__ import annotations
 
 import os
@@ -29,7 +28,6 @@ from audio_engine import (
 
 load_dotenv()
 
-# Strip trailing whitespace and any accidental trailing slash from URL.
 SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
 BUCKET = os.environ.get("MIXMASTER_BUCKET", "audio").strip()
@@ -43,7 +41,6 @@ sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 
 # --- helpers ---------------------------------------------------------------
-
 def log(msg: str) -> None:
     print(f"[{datetime.now(timezone.utc).isoformat()}] {msg}", flush=True)
 
@@ -98,42 +95,60 @@ def fetch_project(project_id: str) -> dict | None:
 
 
 def claim_next_job():
-    """Atomically claim the next queued job."""
-    res = (
-        sb.table("audio_jobs")
-        .select("*")
-        .eq("status", "queued")
-        .order("created_at", desc=False)
-        .limit(1)
-        .execute()
-    )
+    """Atomically claim the next queued job. Verbose logging on every poll."""
+    log("checking for queued jobs (status='queued')")
+    try:
+        res = (
+            sb.table("audio_jobs")
+            .select("id,project_id,user_id,status,stage,progress,created_at")
+            .eq("status", "queued")
+            .order("created_at", desc=False)
+            .limit(1)
+            .execute()
+        )
+    except Exception as exc:
+        log(f"[poll] supabase select FAILED: {exc}")
+        traceback.print_exc()
+        return None
+
     rows = res.data or []
+    log(f"[poll] supabase returned {len(rows)} row(s): {rows}")
+
     if not rows:
         return None
+
     job = rows[0]
-    upd = (
-        sb.table("audio_jobs")
-        .update({
-            "status": "processing",
-            "started_at": now_iso(),
-            "stage": "Processing",
-            "progress": 5,
-        })
-        .eq("id", job["id"])
-        .eq("status", "queued")
-        .execute()
-    )
-    if not upd.data:
-        # Another worker grabbed it.
+    job_id = job["id"]
+    log(f"[poll] attempting to claim job {job_id}")
+
+    try:
+        upd = (
+            sb.table("audio_jobs")
+            .update({
+                "status": "processing",
+                "started_at": now_iso(),
+                "stage": "Processing",
+                "progress": 5,
+            })
+            .eq("id", job_id)
+            .eq("status", "queued")
+            .execute()
+        )
+    except Exception as exc:
+        log(f"[poll] claim update FAILED for job {job_id}: {exc}")
+        traceback.print_exc()
         return None
+
+    if not upd.data:
+        log(f"[poll] job {job_id} was claimed by another worker")
+        return None
+
+    log(f"[poll] CLAIMED job {job_id} -> status='processing'")
     return upd.data[0]
 
 
 # --- processing ------------------------------------------------------------
-
 def normalize_storage_path(value: str) -> str:
-    """Accept either a storage key or a public/signed URL and return the
-    object key relative to the bucket."""
     if not value:
         return value
     marker = f"/object/public/{BUCKET}/"
@@ -159,7 +174,6 @@ def process_master(job: dict) -> None:
     src = project.get("original_file_url")
     if not src:
         raise RuntimeError("project missing original_file_url")
-
     src_key = normalize_storage_path(src)
 
     target_lufs = float(project.get("lufs_target") or -14.0)
@@ -198,7 +212,6 @@ def process_master(job: dict) -> None:
             lufs_target=target_lufs,
             peak_level=ceiling_db,
         )
-
         update_job(
             job_id,
             status="complete",
@@ -207,7 +220,6 @@ def process_master(job: dict) -> None:
             completed_at=now_iso(),
         )
 
-        # Decrement the user's credits by 1 (best-effort).
         try:
             user_id = job.get("user_id")
             if user_id:
@@ -255,24 +267,35 @@ def handle_job(job: dict) -> None:
 
 
 # --- main loop -------------------------------------------------------------
-
 def main() -> None:
-    log(f"MixMasterOS worker started — url={SUPABASE_URL} bucket={BUCKET}")
+    log(f"MixMasterOS worker started — url={SUPABASE_URL} bucket={BUCKET} interval={POLL_INTERVAL}s")
+    cycle = 0
     while True:
+        cycle += 1
         try:
+            log(f"--- poll cycle #{cycle} ---")
             job = claim_next_job()
             if job:
                 handle_job(job)
+                # Immediately loop again to drain the queue.
+                continue
             else:
+                log(f"no queued jobs, sleeping {POLL_INTERVAL}s")
                 time.sleep(POLL_INTERVAL)
         except KeyboardInterrupt:
             log("shutting down")
             return
         except Exception as exc:
-            log(f"poll error: {exc}")
+            log(f"[poll] UNHANDLED loop error: {exc}")
             traceback.print_exc()
             time.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        log(f"[fatal] worker crashed: {exc}")
+        traceback.print_exc()
+        # Re-raise so Render restarts the service.
+        raise
