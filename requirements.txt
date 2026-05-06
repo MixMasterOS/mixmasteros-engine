@@ -1,12 +1,8 @@
-services:
-  - type: worker
-    name: mixmasteros-engine
-    runtime: docker
-    plan: standard
-    envVars:
-      - key: SUPABASE_URL
-        sync: false
-      - key: SUPABASE_SERVICE_ROLE_KEY
-        sync: false
-      - key: AUDIO_BUCKET
-        value: audio
+supabase
+python-dotenv
+numpy
+scipy
+librosa
+soundfile
+pyloudnorm
+pedalboard
