@@ -1,42 +1,73 @@
-"""Supabase Storage helpers for the MixMasterOS worker."""
+"""
+MixMasterOS internal audio engine.
+All DSP primitives used by main.py live here.
+
+Public API:
+    load_audio(path)            -> (samples: np.ndarray [channels, frames], sr: int)
+    write_wav(path, samples, sr) -> None
+    normalize_loudness(samples, sr, target_lufs=-14.0) -> np.ndarray
+    true_peak_limit(samples, ceiling_db=-1.0) -> np.ndarray
+"""
+
 from __future__ import annotations
 
-import os
-from typing import Optional
-
-BUCKET = "audio"
-
-
-def download(supabase, path: str, dest: str) -> str:
-    """Download an object from the audio bucket to a local file."""
-    data = supabase.storage.from_(BUCKET).download(path)
-    with open(dest, "wb") as f:
-        f.write(data)
-    return dest
+import numpy as np
+import soundfile as sf
+import pyloudnorm as pyln
 
 
-def upload(supabase, local_path: str, dest_path: str, content_type: str) -> str:
-    """Upload a local file to the audio bucket. Overwrites if exists."""
-    with open(local_path, "rb") as f:
-        data = f.read()
+def load_audio(path: str):
+    """Load an audio file as float32 [channels, frames] and sample rate."""
+    data, sr = sf.read(path, always_2d=True, dtype="float32")
+    # soundfile returns [frames, channels]; convert to [channels, frames]
+    samples = data.T.copy()
+    return samples, int(sr)
+
+
+def write_wav(path: str, samples: np.ndarray, sr: int) -> None:
+    """Write a [channels, frames] float array as 24-bit WAV."""
+    arr = np.asarray(samples, dtype=np.float32)
+    if arr.ndim == 1:
+        out = arr.reshape(-1, 1)
+    else:
+        out = arr.T  # back to [frames, channels]
+    sf.write(path, out, sr, subtype="PCM_24")
+
+
+def normalize_loudness(samples: np.ndarray, sr: int, target_lufs: float = -14.0) -> np.ndarray:
+    """Normalize integrated loudness to target LUFS using ITU-R BS.1770."""
+    arr = np.asarray(samples, dtype=np.float32)
+    # pyloudnorm expects [frames] mono or [frames, channels] stereo
+    if arr.ndim == 1:
+        meter_input = arr
+    else:
+        meter_input = arr.T
+
+    meter = pyln.Meter(sr)
     try:
-        supabase.storage.from_(BUCKET).upload(
-            path=dest_path,
-            file=data,
-            file_options={"content-type": content_type, "upsert": "true"},
-        )
+        loudness = meter.integrated_loudness(meter_input)
     except Exception:
-        # Fallback for older client signatures.
-        supabase.storage.from_(BUCKET).update(
-            path=dest_path, file=data,
-            file_options={"content-type": content_type},
-        )
-    return dest_path
+        return arr
+
+    if not np.isfinite(loudness):
+        return arr
+
+    normalized = pyln.normalize.loudness(meter_input, loudness, target_lufs)
+    if normalized.ndim == 1:
+        return normalized.astype(np.float32)
+    return normalized.T.astype(np.float32)
 
 
-def signed_url(supabase, path: str, expires_in: int = 60 * 60 * 24 * 7) -> Optional[str]:
-    try:
-        res = supabase.storage.from_(BUCKET).create_signed_url(path, expires_in)
-        return res.get("signedURL") or res.get("signed_url")
-    except Exception:
-        return None
+def true_peak_limit(samples: np.ndarray, ceiling_db: float = -1.0) -> np.ndarray:
+    """Simple peak limiter: scales signal so its peak sits at ceiling_db dBFS."""
+    arr = np.asarray(samples, dtype=np.float32)
+    peak = float(np.max(np.abs(arr))) if arr.size else 0.0
+    if peak <= 0.0:
+        return arr
+
+    ceiling_linear = 10.0 ** (ceiling_db / 20.0)
+    if peak <= ceiling_linear:
+        return arr
+
+    gain = ceiling_linear / peak
+    return (arr * gain).astype(np.float32)

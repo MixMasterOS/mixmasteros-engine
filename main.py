@@ -1,85 +1,184 @@
-"""Stem mixing: balance levels, light EQ per stem, sum to a stereo mix."""
+"""
+MixMasterOS background worker.
+
+Polls the Supabase `audio_jobs` table, downloads source audio from the
+`audio` storage bucket, processes it with the internal engine, then uploads
+the mastered WAV/MP3 back to storage and marks the job complete.
+"""
+
 from __future__ import annotations
 
-from typing import Dict
+import os
+import sys
+import time
+import tempfile
+import traceback
+import subprocess
+from datetime import datetime, timezone
 
-import numpy as np
-from pedalboard import Pedalboard, Compressor, HighpassFilter, HighShelfFilter, LowShelfFilter
+from dotenv import load_dotenv
+from supabase import create_client, Client
 
-from audio_engine import load_audio, write_wav, normalize_loudness, true_peak_limit
+from audio_engine import (
+    load_audio,
+    write_wav,
+    normalize_loudness,
+    true_peak_limit,
+)
 
+load_dotenv()
 
-# Rough per-stem gain targets (dB) relative to unity.
-STEM_GAINS_DB: Dict[str, float] = {
-    "vocals": 0.0,
-    "vocal": 0.0,
-    "drums": -2.0,
-    "bass": -3.0,
-    "instrumental": -3.0,
-    "beat": -3.0,
-    "music": -3.0,
-    "other": -4.0,
-}
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+BUCKET = os.environ.get("MIXMASTER_BUCKET", "audio")
+POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "5"))
 
+if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+    print("[fatal] SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set", flush=True)
+    sys.exit(1)
 
-def _gain(audio: np.ndarray, gain_db: float) -> np.ndarray:
-    return audio * (10 ** (gain_db / 20.0))
-
-
-def _process_stem(audio: np.ndarray, sr: int, kind: str) -> np.ndarray:
-    kind = (kind or "other").lower()
-    if "voc" in kind:
-        board = Pedalboard([
-            HighpassFilter(cutoff_frequency_hz=90.0),
-            HighShelfFilter(cutoff_frequency_hz=10000.0, gain_db=2.0, q=0.7),
-            Compressor(threshold_db=-18.0, ratio=3.0, attack_ms=5.0, release_ms=80.0),
-        ])
-    elif "bass" in kind:
-        board = Pedalboard([
-            LowShelfFilter(cutoff_frequency_hz=80.0, gain_db=1.5, q=0.7),
-            Compressor(threshold_db=-16.0, ratio=2.5, attack_ms=10.0, release_ms=120.0),
-        ])
-    elif "drum" in kind or "beat" in kind:
-        board = Pedalboard([
-            HighpassFilter(cutoff_frequency_hz=35.0),
-            Compressor(threshold_db=-14.0, ratio=2.0, attack_ms=8.0, release_ms=100.0),
-        ])
-    else:
-        board = Pedalboard([
-            HighpassFilter(cutoff_frequency_hz=40.0),
-            Compressor(threshold_db=-16.0, ratio=2.0, attack_ms=10.0, release_ms=120.0),
-        ])
-    out = board(audio, sr)
-    gain = STEM_GAINS_DB.get(kind, -4.0)
-    return _gain(np.asarray(out, dtype=np.float32), gain)
+sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 
-def mix_stems(stems: Dict[str, str], output_path: str) -> str:
-    """`stems` is a dict mapping stem kind ("vocals", "drums", ...) -> file path."""
-    if not stems:
-        raise ValueError("No stems provided")
+# --- helpers ---------------------------------------------------------------
 
-    rendered = []
-    sr_ref = None
-    max_len = 0
-    for kind, path in stems.items():
-        audio, sr = load_audio(path)
-        if sr_ref is None:
-            sr_ref = sr
-        rendered.append((_process_stem(audio, sr, kind), sr))
-        max_len = max(max_len, audio.shape[0])
+def log(msg: str) -> None:
+    print(f"[{datetime.now(timezone.utc).isoformat()}] {msg}", flush=True)
 
-    # Pad/sum to common length, mono->stereo if needed.
-    summed = np.zeros((max_len, 2), dtype=np.float32)
-    for audio, _ in rendered:
-        if audio.shape[1] == 1:
-            audio = np.repeat(audio, 2, axis=1)
-        if audio.shape[0] < max_len:
-            pad = np.zeros((max_len - audio.shape[0], audio.shape[1]), dtype=np.float32)
-            audio = np.vstack([audio, pad])
-        summed += audio[:max_len, :2]
 
-    summed = normalize_loudness(summed, sr_ref or 44100, target_lufs=-14.0)
-    summed = true_peak_limit(summed, ceiling_db=-1.5)
-    write_wav(output_path, summed, sr_ref or 44100)
-    return output_path
+def storage_download(path: str, dest: str) -> None:
+    data = sb.storage.from_(BUCKET).download(path)
+    with open(dest, "wb") as f:
+        f.write(data)
+
+
+def storage_upload(path: str, src: str, content_type: str) -> None:
+    with open(src, "rb") as f:
+        sb.storage.from_(BUCKET).upload(
+            path,
+            f.read(),
+            {"content-type": content_type, "upsert": "true"},
+        )
+
+
+def export_mp3(wav_path: str, mp3_path: str) -> None:
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", wav_path, "-codec:a", "libmp3lame",
+         "-b:a", "320k", mp3_path],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def update_job(job_id: str, **fields) -> None:
+    fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+    sb.table("audio_jobs").update(fields).eq("id", job_id).execute()
+
+
+def claim_next_job():
+    res = (
+        sb.table("audio_jobs")
+        .select("*")
+        .eq("status", "queued")
+        .order("created_at")
+        .limit(1)
+        .execute()
+    )
+    rows = res.data or []
+    if not rows:
+        return None
+    job = rows[0]
+    upd = (
+        sb.table("audio_jobs")
+        .update({
+            "status": "processing",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        })
+        .eq("id", job["id"])
+        .eq("status", "queued")
+        .execute()
+    )
+    if not upd.data:
+        return None
+    return job
+
+
+# --- processing ------------------------------------------------------------
+
+def process_master(job: dict) -> None:
+    job_id = job["id"]
+    src_path = job.get("source_path") or job.get("input_path")
+    if not src_path:
+        raise ValueError("job missing source_path")
+
+    target_lufs = float(job.get("target_lufs") or -14.0)
+    ceiling_db = float(job.get("ceiling_db") or -1.0)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        in_path = os.path.join(tmp, "in.wav")
+        out_wav = os.path.join(tmp, "out.wav")
+        out_mp3 = os.path.join(tmp, "out.mp3")
+
+        log(f"[{job_id}] downloading {src_path}")
+        storage_download(src_path, in_path)
+
+        log(f"[{job_id}] processing")
+        samples, sr = load_audio(in_path)
+        samples = normalize_loudness(samples, sr, target_lufs=target_lufs)
+        samples = true_peak_limit(samples, ceiling_db=ceiling_db)
+        write_wav(out_wav, samples, sr)
+        export_mp3(out_wav, out_mp3)
+
+        wav_key = f"processed/{job_id}.wav"
+        mp3_key = f"processed/{job_id}.mp3"
+
+        log(f"[{job_id}] uploading results")
+        storage_upload(wav_key, out_wav, "audio/wav")
+        storage_upload(mp3_key, out_mp3, "audio/mpeg")
+
+        update_job(
+            job_id,
+            status="completed",
+            output_wav_path=wav_key,
+            output_mp3_path=mp3_key,
+            completed_at=datetime.now(timezone.utc).isoformat(),
+        )
+        log(f"[{job_id}] done")
+
+
+def handle_job(job: dict) -> None:
+    job_id = job["id"]
+    try:
+        process_master(job)
+    except Exception as exc:
+        log(f"[{job_id}] FAILED: {exc}")
+        traceback.print_exc()
+        try:
+            update_job(job_id, status="failed", error=str(exc))
+        except Exception:
+            pass
+
+
+# --- main loop -------------------------------------------------------------
+
+def main() -> None:
+    log("MixMasterOS worker started")
+    while True:
+        try:
+            job = claim_next_job()
+            if job:
+                handle_job(job)
+            else:
+                time.sleep(POLL_INTERVAL)
+        except KeyboardInterrupt:
+            log("shutting down")
+            return
+        except Exception as exc:
+            log(f"poll error: {exc}")
+            traceback.print_exc()
+            time.sleep(POLL_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
