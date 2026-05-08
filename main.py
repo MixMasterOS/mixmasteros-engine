@@ -15,7 +15,8 @@ import tempfile
 import traceback
 import subprocess
 from datetime import datetime, timezone
-
+from pathlib import Path
+from exports import finalize_master
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
@@ -205,21 +206,7 @@ patch = finalize_master(
 
 log(f"finalize_master patched columns: {list(patch.keys())}")
 
-        update_project(
-            project_id,
-           master_wav_url=wav24_key,
-master_mp3_url=mp3_320_key,
-
-master_wav32_url=wav32_key,
-master_wav24_url=wav24_key,
-master_wav16_url=wav16_key,
-
-master_mp3_320_url=mp3_320_key,
-master_mp3_v0_url=mp3_v0_key,
-            status="complete",
-            lufs_target=target_lufs,
-            peak_level=ceiling_db,
-        )
+       
         update_job(
             job_id,
             status="complete",
