@@ -194,54 +194,16 @@ samples, sr = load_audio(in_path)
 samples = normalize_loudness(samples, sr, target_lufs=target_lufs)
 samples = true_peak_limit(samples, ceiling_db=ceiling_db)
 
-write_wav(out_wav32, samples, sr)
+write_wav(out_wav, samples, sr)
 
-subprocess.run([
-    "ffmpeg", "-y",
-    "-i", out_wav32,
-    "-c:a", "pcm_s24le",
-    out_wav24
-], check=True)
+patch = finalize_master(
+    project_id=project_id,
+    user_id=job["user_id"],
+    mastered_source_path=Path(out_wav),
+    project_name=project.get("project_name", "master"),
+)
 
-subprocess.run([
-    "ffmpeg", "-y",
-    "-i", out_wav32,
-    "-c:a", "pcm_s16le",
-    out_wav16
-], check=True)
-
-subprocess.run([
-    "ffmpeg", "-y",
-    "-i", out_wav24,
-    "-codec:a", "libmp3lame",
-    "-b:a", "320k",
-    out_mp3_320
-], check=True)
-
-subprocess.run([
-    "ffmpeg", "-y",
-    "-i", out_wav24,
-    "-codec:a", "libmp3lame",
-    "-q:a", "0",
-    out_mp3_v0
-], check=True)
-
-wav32_key = f"masters/{project_id}/{job_id}_32.wav"
-wav24_key = f"masters/{project_id}/{job_id}_24.wav"
-wav16_key = f"masters/{project_id}/{job_id}_16.wav"
-
-mp3_320_key = f"masters/{project_id}/{job_id}_320.mp3"
-mp3_v0_key = f"masters/{project_id}/{job_id}_v0.mp3"
-
-log(f"[{job_id}] uploading results")
-update_job(job_id, stage="Uploading", progress=85)
-
-storage_upload(wav32_key, out_wav32, "audio/wav")
-storage_upload(wav24_key, out_wav24, "audio/wav")
-storage_upload(wav16_key, out_wav16, "audio/wav")
-
-storage_upload(mp3_320_key, out_mp3_320, "audio/mpeg")
-storage_upload(mp3_v0_key, out_mp3_v0, "audio/mpeg")
+log(f"finalize_master patched columns: {list(patch.keys())}")
 
         update_project(
             project_id,
