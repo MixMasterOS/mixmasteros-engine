@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from exports import finalize_master
 from typing import Tuple
 
 import numpy as np
