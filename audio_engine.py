@@ -1,9 +1,10 @@
 """
 MixMasterOS internal audio engine.
+
 All DSP primitives used by main.py live here.
 
 Public API:
-    load_audio(path)            -> (samples: np.ndarray [channels, frames], sr: int)
+    load_audio(path)             -> (samples: np.ndarray [channels, frames], sr: int)
     write_wav(path, samples, sr) -> None
     normalize_loudness(samples, sr, target_lufs=-14.0) -> np.ndarray
     true_peak_limit(samples, ceiling_db=-1.0) -> np.ndarray
@@ -15,6 +16,8 @@ import numpy as np
 import soundfile as sf
 import pyloudnorm as pyln
 
+TARGET_LUFS = -14.0
+
 
 def load_audio(path: str):
     """Load an audio file as float32 [channels, frames] and sample rate."""
@@ -25,16 +28,21 @@ def load_audio(path: str):
 
 
 def write_wav(path: str, samples: np.ndarray, sr: int) -> None:
-    """Write a [channels, frames] float array as 24-bit WAV."""
+    """Write a [channels, frames] float array as 32-bit float WAV.
+
+    Float preserves full DSP precision so downstream encoders (exports.py)
+    can produce true 32f / 24-bit / 16-bit deliverables without re-quantizing
+    a 24-bit intermediate.
+    """
     arr = np.asarray(samples, dtype=np.float32)
     if arr.ndim == 1:
         out = arr.reshape(-1, 1)
     else:
         out = arr.T  # back to [frames, channels]
-    sf.write(path, out, sr, subtype="PCM_24")
+    sf.write(path, out, sr, subtype="FLOAT")
 
 
-def normalize_loudness(samples: np.ndarray, sr: int, target_lufs: float = -14.0) -> np.ndarray:
+def normalize_loudness(samples: np.ndarray, sr: int, target_lufs: float = TARGET_LUFS) -> np.ndarray:
     """Normalize integrated loudness to target LUFS using ITU-R BS.1770."""
     arr = np.asarray(samples, dtype=np.float32)
     # pyloudnorm expects [frames] mono or [frames, channels] stereo
@@ -48,7 +56,6 @@ def normalize_loudness(samples: np.ndarray, sr: int, target_lufs: float = -14.0)
         loudness = meter.integrated_loudness(meter_input)
     except Exception:
         return arr
-
     if not np.isfinite(loudness):
         return arr
 
@@ -64,10 +71,8 @@ def true_peak_limit(samples: np.ndarray, ceiling_db: float = -1.0) -> np.ndarray
     peak = float(np.max(np.abs(arr))) if arr.size else 0.0
     if peak <= 0.0:
         return arr
-
     ceiling_linear = 10.0 ** (ceiling_db / 20.0)
     if peak <= ceiling_linear:
         return arr
-
     gain = ceiling_linear / peak
     return (arr * gain).astype(np.float32)
