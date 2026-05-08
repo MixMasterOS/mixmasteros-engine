@@ -3,9 +3,11 @@ MixMasterOS background worker.
 
 Polls the Supabase `audio_jobs` table, fetches the matching project row,
 downloads source audio from the `audio` storage bucket, processes it with
-the internal engine, then uploads the mastered WAV/MP3 back to storage and
-updates both the job and the project.
+the internal engine, then hands off to exports.finalize_master() which
+produces all 5 deliverables (32f/24/16 WAV + 320/V0 MP3), uploads them,
+patches the project row, and calls verify-wav.
 """
+
 from __future__ import annotations
 
 import os
@@ -13,13 +15,13 @@ import sys
 import time
 import tempfile
 import traceback
-import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from exports import finalize_master
+
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
+from exports import finalize_master
 from audio_engine import (
     load_audio,
     write_wav,
@@ -42,6 +44,7 @@ sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 
 # --- helpers ---------------------------------------------------------------
+
 def log(msg: str) -> None:
     print(f"[{datetime.now(timezone.utc).isoformat()}] {msg}", flush=True)
 
@@ -54,25 +57,6 @@ def storage_download(path: str, dest: str) -> None:
     data = sb.storage.from_(BUCKET).download(path)
     with open(dest, "wb") as f:
         f.write(data)
-
-
-def storage_upload(path: str, src: str, content_type: str) -> None:
-    with open(src, "rb") as f:
-        sb.storage.from_(BUCKET).upload(
-            path,
-            f.read(),
-            {"content-type": content_type, "upsert": "true"},
-        )
-
-
-def export_mp3(wav_path: str, mp3_path: str) -> None:
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", wav_path, "-codec:a", "libmp3lame",
-         "-b:a", "320k", mp3_path],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
 
 
 def update_job(job_id: str, **fields) -> None:
@@ -113,8 +97,7 @@ def claim_next_job():
         return None
 
     rows = res.data or []
-    log(f"[poll] supabase returned {len(rows)} row(s): {rows}")
-
+    log(f"[poll] supabase returned {len(rows)} row(s)")
     if not rows:
         return None
 
@@ -148,7 +131,6 @@ def claim_next_job():
     return upd.data[0]
 
 
-# --- processing ------------------------------------------------------------
 def normalize_storage_path(value: str) -> str:
     if not value:
         return value
@@ -164,6 +146,8 @@ def normalize_storage_path(value: str) -> str:
     return value
 
 
+# --- processing ------------------------------------------------------------
+
 def process_master(job: dict) -> None:
     job_id = job["id"]
     project_id = job["project_id"]
@@ -175,38 +159,40 @@ def process_master(job: dict) -> None:
     src = project.get("original_file_url")
     if not src:
         raise RuntimeError("project missing original_file_url")
-    src_key = normalize_storage_path(src)
 
+    src_key = normalize_storage_path(src)
     target_lufs = float(project.get("lufs_target") or -14.0)
     ceiling_db = float(project.get("peak_level") or -1.0)
 
     with tempfile.TemporaryDirectory() as tmp:
-       out_wav32 = os.path.join(tmp, "master_32.wav")
-out_wav24 = os.path.join(tmp, "master_24.wav")
-out_wav16 = os.path.join(tmp, "master_16.wav")
+        in_path = os.path.join(tmp, "input.wav")
+        out_wav = os.path.join(tmp, "master_float.wav")
 
-out_mp3_320 = os.path.join(tmp, "master_320.mp3")
-out_mp3_v0 = os.path.join(tmp, "master_v0.mp3")
+        log(f"[{job_id}] downloading source: {src_key}")
+        update_job(job_id, stage="Downloading", progress=15)
+        storage_download(src_key, in_path)
 
-log(f"[{job_id}] processing")
-update_job(job_id, stage="Mastering", progress=45)
+        log(f"[{job_id}] mastering")
+        update_job(job_id, stage="Mastering", progress=45)
 
-samples, sr = load_audio(in_path)
-samples = normalize_loudness(samples, sr, target_lufs=target_lufs)
-samples = true_peak_limit(samples, ceiling_db=ceiling_db)
+        # ---- DSP CHAIN (untouched) ----
+        samples, sr = load_audio(in_path)
+        samples = normalize_loudness(samples, sr, target_lufs=target_lufs)
+        samples = true_peak_limit(samples, ceiling_db=ceiling_db)
+        write_wav(out_wav, samples, sr)
+        # -------------------------------
 
-write_wav(out_wav, samples, sr)
+        log(f"[{job_id}] exporting deliverables (32f/24/16 WAV + 320/V0 MP3)")
+        update_job(job_id, stage="Exporting", progress=80)
 
-patch = finalize_master(
-    project_id=project_id,
-    user_id=job["user_id"],
-    mastered_source_path=Path(out_wav),
-    project_name=project.get("project_name", "master"),
-)
+        patch = finalize_master(
+            project_id=project_id,
+            user_id=job["user_id"],
+            mastered_source_path=Path(out_wav),
+            project_name=project.get("project_name", "master"),
+        )
+        log(f"[{job_id}] finalize_master patched: {list(patch.keys())}")
 
-log(f"finalize_master patched columns: {list(patch.keys())}")
-
-       
         update_job(
             job_id,
             status="complete",
@@ -262,6 +248,7 @@ def handle_job(job: dict) -> None:
 
 
 # --- main loop -------------------------------------------------------------
+
 def main() -> None:
     log(f"MixMasterOS worker started — url={SUPABASE_URL} bucket={BUCKET} interval={POLL_INTERVAL}s")
     cycle = 0
@@ -272,11 +259,9 @@ def main() -> None:
             job = claim_next_job()
             if job:
                 handle_job(job)
-                # Immediately loop again to drain the queue.
                 continue
-            else:
-                log(f"no queued jobs, sleeping {POLL_INTERVAL}s")
-                time.sleep(POLL_INTERVAL)
+            log(f"no queued jobs, sleeping {POLL_INTERVAL}s")
+            time.sleep(POLL_INTERVAL)
         except KeyboardInterrupt:
             log("shutting down")
             return
@@ -292,5 +277,4 @@ if __name__ == "__main__":
     except Exception as exc:
         log(f"[fatal] worker crashed: {exc}")
         traceback.print_exc()
-        # Re-raise so Render restarts the service.
         raise
