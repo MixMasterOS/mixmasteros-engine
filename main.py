@@ -2,10 +2,11 @@
 MixMasterOS background worker.
 
 Polls the Supabase `audio_jobs` table, fetches the matching project row,
-downloads source audio from the `audio` storage bucket, processes it with
-the internal engine, then hands off to exports.finalize_master() which
-produces all 5 deliverables (32f/24/16 WAV + 320/V0 MP3), uploads them,
-patches the project row, and calls verify-wav.
+downloads source audio from the `audio` storage bucket, runs the full
+mastering chain (EQ → comp → limiter → LUFS norm → TP limit), then hands
+off to exports.finalize_master() which produces all 5 deliverables
+(32f/24/16 WAV + 320/V0 MP3), uploads them, patches the project row,
+and calls verify-wav.
 """
 
 from __future__ import annotations
@@ -22,12 +23,7 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 
 from exports import finalize_master
-from audio_engine import (
-    load_audio,
-    write_wav,
-    normalize_loudness,
-    true_peak_limit,
-)
+from mixing import master_file
 
 load_dotenv()
 
@@ -162,7 +158,6 @@ def process_master(job: dict) -> None:
 
     src_key = normalize_storage_path(src)
     target_lufs = float(project.get("lufs_target") or -14.0)
-    ceiling_db = float(project.get("peak_level") or -1.0)
 
     with tempfile.TemporaryDirectory() as tmp:
         in_path = os.path.join(tmp, "input.wav")
@@ -172,15 +167,12 @@ def process_master(job: dict) -> None:
         update_job(job_id, stage="Downloading", progress=15)
         storage_download(src_key, in_path)
 
-        log(f"[{job_id}] mastering")
+        log(f"[{job_id}] mastering (EQ → comp → limiter → LUFS → TP)")
         update_job(job_id, stage="Mastering", progress=45)
 
-        # ---- DSP CHAIN (untouched) ----
-        samples, sr = load_audio(in_path)
-        samples = normalize_loudness(samples, sr, target_lufs=target_lufs)
-        samples = true_peak_limit(samples, ceiling_db=ceiling_db)
-        write_wav(out_wav, samples, sr)
-        # -------------------------------
+        # ---- Full mastering chain (defined in mixing.py, do not duplicate here) ----
+        master_file(in_path, out_wav, target_lufs=target_lufs)
+        # ---------------------------------------------------------------------------
 
         log(f"[{job_id}] exporting deliverables (32f/24/16 WAV + 320/V0 MP3)")
         update_job(job_id, stage="Exporting", progress=80)
@@ -278,3 +270,4 @@ if __name__ == "__main__":
         log(f"[fatal] worker crashed: {exc}")
         traceback.print_exc()
         raise
+
