@@ -180,34 +180,80 @@ def process_master(job: dict) -> None:
     ceiling_db = float(project.get("peak_level") or -1.0)
 
     with tempfile.TemporaryDirectory() as tmp:
-        in_path = os.path.join(tmp, "in.wav")
-        out_wav = os.path.join(tmp, "out.wav")
-        out_mp3 = os.path.join(tmp, "out.mp3")
+       out_wav32 = os.path.join(tmp, "master_32.wav")
+out_wav24 = os.path.join(tmp, "master_24.wav")
+out_wav16 = os.path.join(tmp, "master_16.wav")
 
-        log(f"[{job_id}] downloading {src_key}")
-        update_job(job_id, stage="Downloading", progress=15)
-        storage_download(src_key, in_path)
+out_mp3_320 = os.path.join(tmp, "master_320.mp3")
+out_mp3_v0 = os.path.join(tmp, "master_v0.mp3")
 
-        log(f"[{job_id}] processing")
-        update_job(job_id, stage="Mastering", progress=45)
-        samples, sr = load_audio(in_path)
-        samples = normalize_loudness(samples, sr, target_lufs=target_lufs)
-        samples = true_peak_limit(samples, ceiling_db=ceiling_db)
-        write_wav(out_wav, samples, sr)
-        export_mp3(out_wav, out_mp3)
+log(f"[{job_id}] processing")
+update_job(job_id, stage="Mastering", progress=45)
 
-        wav_key = f"masters/{project_id}/{job_id}.wav"
-        mp3_key = f"masters/{project_id}/{job_id}.mp3"
+samples, sr = load_audio(in_path)
+samples = normalize_loudness(samples, sr, target_lufs=target_lufs)
+samples = true_peak_limit(samples, ceiling_db=ceiling_db)
 
-        log(f"[{job_id}] uploading results")
-        update_job(job_id, stage="Uploading", progress=85)
-        storage_upload(wav_key, out_wav, "audio/wav")
-        storage_upload(mp3_key, out_mp3, "audio/mpeg")
+write_wav(out_wav32, samples, sr)
+
+subprocess.run([
+    "ffmpeg", "-y",
+    "-i", out_wav32,
+    "-c:a", "pcm_s24le",
+    out_wav24
+], check=True)
+
+subprocess.run([
+    "ffmpeg", "-y",
+    "-i", out_wav32,
+    "-c:a", "pcm_s16le",
+    out_wav16
+], check=True)
+
+subprocess.run([
+    "ffmpeg", "-y",
+    "-i", out_wav24,
+    "-codec:a", "libmp3lame",
+    "-b:a", "320k",
+    out_mp3_320
+], check=True)
+
+subprocess.run([
+    "ffmpeg", "-y",
+    "-i", out_wav24,
+    "-codec:a", "libmp3lame",
+    "-q:a", "0",
+    out_mp3_v0
+], check=True)
+
+wav32_key = f"masters/{project_id}/{job_id}_32.wav"
+wav24_key = f"masters/{project_id}/{job_id}_24.wav"
+wav16_key = f"masters/{project_id}/{job_id}_16.wav"
+
+mp3_320_key = f"masters/{project_id}/{job_id}_320.mp3"
+mp3_v0_key = f"masters/{project_id}/{job_id}_v0.mp3"
+
+log(f"[{job_id}] uploading results")
+update_job(job_id, stage="Uploading", progress=85)
+
+storage_upload(wav32_key, out_wav32, "audio/wav")
+storage_upload(wav24_key, out_wav24, "audio/wav")
+storage_upload(wav16_key, out_wav16, "audio/wav")
+
+storage_upload(mp3_320_key, out_mp3_320, "audio/mpeg")
+storage_upload(mp3_v0_key, out_mp3_v0, "audio/mpeg")
 
         update_project(
             project_id,
-            master_wav_url=wav_key,
-            master_mp3_url=mp3_key,
+           master_wav_url=wav24_key,
+master_mp3_url=mp3_320_key,
+
+master_wav32_url=wav32_key,
+master_wav24_url=wav24_key,
+master_wav16_url=wav16_key,
+
+master_mp3_320_url=mp3_320_key,
+master_mp3_v0_url=mp3_v0_key,
             status="complete",
             lufs_target=target_lufs,
             peak_level=ceiling_db,
